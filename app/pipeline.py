@@ -143,8 +143,9 @@ def synthesize_qwen_clone(text: str, target_language: str, ref_audio: Path, ref_
         log(f"TTS FlashAttention2 load failed; falling back to PyTorch SDPA: {e}")
         model = Qwen3TTSModel.from_pretrained(cfg.tts_model, attn_implementation="sdpa", **kwargs)
 
-    log("Creating voice-clone prompt...")
-    prompt = model.create_voice_clone_prompt(ref_audio=str(ref_audio), ref_text=ref_text, x_vector_only_mode=False)
+    x_vector_only = os.getenv("QWEN_TTS_X_VECTOR_ONLY", "1").strip().lower() not in {"0", "false", "no", "off"}
+    log(f"Creating voice-clone prompt... x_vector_only_mode={x_vector_only}")
+    prompt = model.create_voice_clone_prompt(ref_audio=str(ref_audio), ref_text=ref_text, x_vector_only_mode=x_vector_only)
     max_new_tokens = int(os.getenv("QWEN_TTS_MAX_NEW_TOKENS", "2048") or "2048")
     # Match Qwen's official Base voice-clone example generation settings.
     gen_kwargs = {
