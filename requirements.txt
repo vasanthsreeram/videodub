@@ -1,0 +1,7 @@
+gradio>=5.24.0
+openai>=1.0.0
+qwen-asr
+qwen-tts
+soundfile
+numpy
+python-dotenv
