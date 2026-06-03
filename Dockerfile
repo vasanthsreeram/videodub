@@ -53,24 +53,46 @@ RUN pip install --no-cache-dir torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.
     pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir flash-attn --no-build-isolation || echo "flash-attn optional"
 
-# Download LatentSync checkpoints (cached in volume mount is preferred)
-RUN python download_ckpts.py || echo "Checkpoints will be downloaded at runtime if not mounted"
+# Download LatentSync checkpoints from HuggingFace
+# The LatentSync repo doesn't include a download script; use huggingface-cli directly.
+RUN huggingface-cli download ByteDance/LatentSync-1.6 latentsync_unet.pt whisper/tiny.pt --local-dir checkpoints
 
 # Switch back to base shell for qwen-dub setup
 SHELL ["/bin/bash", "-c"]
 
-# Install Qwen ASR/TTS dependencies in qwen-dub env
+# Install Qwen ASR/TTS dependencies in qwen-dub env.
+# Keep UI/runtime dependencies separate so a model package resolver issue cannot
+# produce a "successful" image that cannot even start Gradio.
 RUN /opt/conda/bin/conda run -n qwen-dub pip install --no-cache-dir \
-    torch==2.4.0 torchaudio==2.4.0 torchvision==0.19.0 --index-url https://download.pytorch.org/whl/cu121 && \
-    /opt/conda/bin/conda run -n qwen-dub pip install --no-cache-dir \
-    gradio>=5.24.0 \
-    openai>=1.0.0 \
-    qwen-asr \
-    qwen-tts \
+    torch==2.4.0 torchaudio==2.4.0 torchvision==0.19.0 --index-url https://download.pytorch.org/whl/cu121
+
+RUN /opt/conda/bin/conda run -n qwen-dub pip install --no-cache-dir \
+    'gradio>=5.24.0' \
+    'openai>=1.0.0' \
     soundfile \
     numpy \
-    python-dotenv && \
-    /opt/conda/bin/conda run -n qwen-dub pip install --no-cache-dir flash-attn --no-build-isolation || echo "flash-attn optional"
+    python-dotenv
+
+# Install qwen-asr/qwen-tts dependencies first, then packages with --no-deps
+# to avoid resolver conflicts while ensuring all runtime deps are present.
+# These are the key dependencies for the Qwen ASR/TTS models:
+RUN /opt/conda/bin/conda run -n qwen-dub pip install --no-cache-dir \
+    transformers \
+    accelerate \
+    einops \
+    librosa \
+    sox
+
+RUN /opt/conda/bin/conda run -n qwen-dub pip install --no-cache-dir --no-deps \
+    qwen-asr \
+    qwen-tts
+
+RUN /opt/conda/bin/conda run -n qwen-dub pip install --no-cache-dir flash-attn --no-build-isolation || echo "flash-attn optional"
+
+RUN /opt/conda/bin/conda run -n qwen-dub python - <<'PY'
+import gradio, openai, soundfile, numpy
+print('Core UI/runtime imports OK')
+PY
 
 # Copy application code
 WORKDIR /app/videodub
