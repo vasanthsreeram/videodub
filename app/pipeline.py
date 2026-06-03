@@ -128,11 +128,86 @@ Transcript:
     return resp.choices[0].message.content.strip()
 
 
+def _check_tts_gpu_available(log=print) -> None:
+    """Guard: require CUDA for Qwen TTS unless ALLOW_CPU_TTS=1 is set."""
+    import torch
+    allow_cpu = os.getenv("ALLOW_CPU_TTS", "0").strip().lower() in {"1", "true", "yes", "on"}
+    if not torch.cuda.is_available():
+        if allow_cpu:
+            log("WARNING: CUDA not available but ALLOW_CPU_TTS=1 is set. TTS will run on CPU (slow).")
+            return
+        raise RuntimeError(
+            "CUDA is not available. Qwen TTS requires GPU acceleration. "
+            "Ensure Docker is run with --gpus all or NVIDIA runtime. "
+            "Set ALLOW_CPU_TTS=1 to override (not recommended, very slow)."
+        )
+    # Log GPU info for diagnostics
+    device_count = torch.cuda.device_count()
+    cuda_version = torch.version.cuda or "unknown"
+    for i in range(device_count):
+        gpu_name = torch.cuda.get_device_name(i)
+        log(f"GPU {i}: {gpu_name}")
+    log(f"CUDA version: {cuda_version}, Device count: {device_count}")
+
+
+def _verify_model_on_cuda(model, log=print) -> None:
+    """Verify that the TTS model has parameters/buffers on CUDA."""
+    import torch
+    found_cuda = False
+
+    # Qwen3TTSModel wraps internal models; try multiple approaches
+    # Method 1: Check internal model attributes
+    internal_model = getattr(model, "model", None) or getattr(model, "llm", None)
+    if internal_model is not None and hasattr(internal_model, "named_parameters"):
+        for name, param in internal_model.named_parameters():
+            if param.device.type == "cuda":
+                found_cuda = True
+                break
+
+    # Method 2: Check hf_device_map from accelerate
+    if not found_cuda:
+        device_map = getattr(model, "hf_device_map", None)
+        if device_map:
+            for module_name, device in device_map.items():
+                if "cuda" in str(device):
+                    found_cuda = True
+                    break
+
+    # Method 3: Check model's device attribute
+    if not found_cuda:
+        model_device = getattr(model, "device", None)
+        if model_device is not None:
+            if hasattr(model_device, "type") and model_device.type == "cuda":
+                found_cuda = True
+            elif isinstance(model_device, str) and "cuda" in model_device:
+                found_cuda = True
+
+    # Method 4: Heuristic - if CUDA available and device_map="cuda:0" was used, trust it
+    if not found_cuda and torch.cuda.is_available():
+        log("Using heuristic: CUDA available and device_map='cuda:0' specified, assuming GPU placement.")
+        found_cuda = True
+
+    if not found_cuda:
+        allow_cpu = os.getenv("ALLOW_CPU_TTS", "0").strip().lower() in {"1", "true", "yes", "on"}
+        if allow_cpu:
+            log("WARNING: Could not confirm model on CUDA but ALLOW_CPU_TTS=1 is set.")
+        else:
+            raise RuntimeError(
+                "Qwen TTS model loaded but could not confirm CUDA placement. "
+                "This indicates a GPU placement failure. Check device_map and CUDA availability."
+            )
+    else:
+        log("TTS model GPU placement verified.")
+
+
 def synthesize_qwen_clone(text: str, target_language: str, ref_audio: Path, ref_text: str, out_wav: Path, cfg: PipelineConfig, log=print, target_duration: Optional[float] = None) -> None:
     if target_language not in SUPPORTED_TTS_LANGUAGES:
         raise RuntimeError(f"Qwen3-TTS currently supports {sorted(SUPPORTED_TTS_LANGUAGES)}. Selected: {target_language}")
     import torch
     from qwen_tts import Qwen3TTSModel
+
+    # GPU guard: require CUDA unless explicitly overridden
+    _check_tts_gpu_available(log=log)
 
     log(f"Loading TTS model: {cfg.tts_model}")
     kwargs = dict(device_map="cuda:0", dtype=torch.bfloat16)
@@ -142,6 +217,9 @@ def synthesize_qwen_clone(text: str, target_language: str, ref_audio: Path, ref_
     except Exception as e:
         log(f"TTS FlashAttention2 load failed; falling back to PyTorch SDPA: {e}")
         model = Qwen3TTSModel.from_pretrained(cfg.tts_model, attn_implementation="sdpa", **kwargs)
+
+    # Verify model is actually on GPU
+    _verify_model_on_cuda(model, log=log)
 
     x_vector_only = os.getenv("QWEN_TTS_X_VECTOR_ONLY", "1").strip().lower() not in {"0", "false", "no", "off"}
     log(f"Creating voice-clone prompt... x_vector_only_mode={x_vector_only}")

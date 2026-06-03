@@ -103,7 +103,30 @@ docker run --gpus all -p 7860:7860 \
 └─────────────────────────────────────────────────────────┘
 ```
 
+## GPU Verification
+
+The pipeline requires NVIDIA GPU with CUDA. To verify GPU is correctly configured:
+
+```bash
+# Quick CUDA check (no model download)
+docker exec videodub python /app/videodub/scripts/check_tts_gpu.py
+
+# Full model load test (downloads model if needed)
+docker exec videodub python /app/videodub/scripts/check_tts_gpu.py --load-model
+
+# Check nvidia-smi
+docker exec videodub nvidia-smi
+```
+
+**Important Docker flags:**
+- Must use `--gpus all` or NVIDIA runtime
+- Example: `docker run --gpus all ...`
+
+The TTS will fail loudly at startup if CUDA is not available, unless `ALLOW_CPU_TTS=1` is set (not recommended, very slow).
+
 ## Troubleshooting
+
+**TTS fails with "CUDA is not available"**: Docker was not started with GPU support. Use `--gpus all` flag or ensure NVIDIA Container Toolkit is installed.
 
 **Out of VRAM**: Reduce `LATENTSYNC_STEPS` (try 12) or use smaller TTS model.
 
