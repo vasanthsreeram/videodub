@@ -40,7 +40,7 @@ def build_app():
             video = gr.Video(label="Input video", sources=["upload"])
             with gr.Column():
                 source = gr.Dropdown(["Auto"] + LANGUAGE_CHOICES, value="Auto", label="Source language")
-                target = gr.Dropdown(LANGUAGE_CHOICES[:10], value="English", label="Target language")
+                target = gr.Dropdown(LANGUAGE_CHOICES[:10], value="Chinese", label="Target language")
                 run = gr.Button("Dub video", variant="primary")
         output = gr.Video(label="Dubbed output")
         summary = gr.Textbox(label="Summary", lines=12)
