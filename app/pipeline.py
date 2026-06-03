@@ -104,15 +104,22 @@ def transcribe_qwen(audio: Path, language: Optional[str], cfg: PipelineConfig, l
     return detected, text
 
 
-def translate_deepseek(text: str, target_language: str, cfg: PipelineConfig, source_language: str = "Auto", log=print) -> str:
+def translate_deepseek(text: str, target_language: str, cfg: PipelineConfig, source_language: str = "Auto", log=print, source_duration_hint: Optional[float] = None) -> str:
     from openai import OpenAI
     api_key = os.getenv("DEEPSEEK_API_KEY")
     if not api_key:
         raise RuntimeError("DEEPSEEK_API_KEY is not set. Set it in the shell before launching the UI.")
     client = OpenAI(api_key=api_key, base_url=cfg.deepseek_base_url)
     log(f"Translating to {target_language} with {cfg.deepseek_model}...")
+
+    # Build translation prompt with conciseness guidance for dubbing
+    duration_hint = ""
+    if source_duration_hint:
+        duration_hint = f"\nIMPORTANT: The original speech is approximately {source_duration_hint:.1f} seconds. Your translation should be concise enough to fit similar speaking duration when spoken aloud. Prefer shorter, natural phrasing over verbose literal translation."
+
     prompt = f"""Translate the following transcript from {source_language} to {target_language}.
 Keep meaning faithful, conversational, and suitable for spoken dubbing.
+Be concise: dubbing requires the translation to fit the original speech timing.{duration_hint}
 Do not add explanations. Return only the translated speech text.
 
 Transcript:
@@ -120,7 +127,7 @@ Transcript:
     resp = client.chat.completions.create(
         model=cfg.deepseek_model,
         messages=[
-            {"role": "system", "content": "You are a professional audiovisual dubbing translator."},
+            {"role": "system", "content": "You are a professional audiovisual dubbing translator specializing in time-constrained adaptations."},
             {"role": "user", "content": prompt},
         ],
         temperature=0.2,
@@ -223,7 +230,12 @@ def synthesize_qwen_clone(text: str, target_language: str, ref_audio: Path, ref_
 
     x_vector_only = os.getenv("QWEN_TTS_X_VECTOR_ONLY", "1").strip().lower() not in {"0", "false", "no", "off"}
     log(f"Creating voice-clone prompt... x_vector_only_mode={x_vector_only}")
-    prompt = model.create_voice_clone_prompt(ref_audio=str(ref_audio), ref_text=ref_text, x_vector_only_mode=x_vector_only)
+    # When x_vector_only=True, ref_text is not used and passing English ref_text can cause leakage
+    # In x-vector-only mode, voice cloning uses speaker embedding only, no text alignment needed
+    effective_ref_text = None if x_vector_only else ref_text
+    if x_vector_only and ref_text:
+        log("x_vector_only=True: ignoring ref_text to prevent source language leakage")
+    prompt = model.create_voice_clone_prompt(ref_audio=str(ref_audio), ref_text=effective_ref_text, x_vector_only_mode=x_vector_only)
     max_new_tokens = int(os.getenv("QWEN_TTS_MAX_NEW_TOKENS", "2048") or "2048")
     # Match Qwen's official Base voice-clone example generation settings.
     gen_kwargs = {
@@ -249,12 +261,41 @@ def synthesize_qwen_clone(text: str, target_language: str, ref_audio: Path, ref_
     sf.write(str(out_wav), wavs[0], sr)
 
 
-def timefit_audio(src_wav: Path, target_duration: float, out_wav: Path, log=print) -> None:
+def timefit_audio(src_wav: Path, target_duration: float, out_wav: Path, log=print) -> dict:
+    """Time-stretch audio to fit target duration. Returns fit metrics.
+
+    Returns dict with keys:
+        - raw_duration: float, original TTS duration
+        - target_duration: float, target duration
+        - ratio: float, raw/target ratio (>1 means speedup needed)
+        - warning: Optional[str], warning if ratio exceeds threshold
+    """
     current = ffprobe_duration(src_wav)
+    result = {
+        "raw_duration": current,
+        "target_duration": target_duration,
+        "ratio": 0.0,
+        "warning": None,
+    }
+
     if current <= 0 or target_duration <= 0:
         shutil.copy2(src_wav, out_wav)
-        return
+        return result
+
     ratio = current / target_duration  # ffmpeg atempo >1 speeds up, <1 slows down
+    result["ratio"] = ratio
+
+    # Warn if significant speedup is required (audio will sound rushed)
+    ATEMPO_WARN_THRESHOLD = float(os.getenv("ATEMPO_WARN_THRESHOLD", "1.20"))
+    ATEMPO_MAX_THRESHOLD = float(os.getenv("ATEMPO_MAX_THRESHOLD", "1.50"))
+
+    if ratio > ATEMPO_MAX_THRESHOLD:
+        result["warning"] = f"CRITICAL: TTS duration {current:.2f}s is {ratio:.2f}x target {target_duration:.2f}s (>{ATEMPO_MAX_THRESHOLD}x). Audio will sound very rushed. Consider shorter translation."
+        log(f"WARNING: {result['warning']}")
+    elif ratio > ATEMPO_WARN_THRESHOLD:
+        result["warning"] = f"TTS duration {current:.2f}s is {ratio:.2f}x target {target_duration:.2f}s (>{ATEMPO_WARN_THRESHOLD}x). Audio may sound rushed."
+        log(f"WARNING: {result['warning']}")
+
     filters = []
     r = ratio
     while r > 2.0:
@@ -266,6 +307,7 @@ def timefit_audio(src_wav: Path, target_duration: float, out_wav: Path, log=prin
     filters.append(f"atempo={r:.6f}")
     log(f"Time-fitting TTS audio: {current:.2f}s -> {target_duration:.2f}s, ratio={ratio:.3f}")
     run_cmd(["ffmpeg", "-y", "-i", str(src_wav), "-filter:a", ",".join(filters), "-ar", "16000", "-ac", "1", str(out_wav)], log=log)
+    return result
 
 
 def cleanup_cuda(log=print) -> None:
@@ -279,6 +321,26 @@ def cleanup_cuda(log=print) -> None:
             log("Cleared CUDA cache before LatentSync.")
     except Exception as e:
         log(f"CUDA cleanup skipped: {e}")
+
+
+def remux_video_with_audio(video: Path, audio: Path, out_video: Path, log=print) -> None:
+    """Remux video with explicit audio track, ensuring the intended audio is used.
+
+    LatentSync may emit video with unexpected audio artifacts. This function
+    explicitly replaces the audio track with the intended driving audio.
+    """
+    log(f"Remuxing video with intended audio: {video} + {audio} -> {out_video}")
+    run_cmd([
+        "ffmpeg", "-y",
+        "-i", str(video),
+        "-i", str(audio),
+        "-c:v", "copy",
+        "-c:a", "aac", "-b:a", "192k",
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-shortest",
+        str(out_video)
+    ], log=log)
 
 
 def run_latentsync(video: Path, audio: Path, out_video: Path, cfg: PipelineConfig, log=print) -> None:
@@ -306,6 +368,10 @@ def run_latentsync(video: Path, audio: Path, out_video: Path, cfg: PipelineConfi
     ]
     ld = ":".join([p for p in ld_parts if p])
     mplconfigdir = cfg.mplconfigdir
+
+    # Output to temporary file first, then remux with intended audio
+    latentsync_temp = out_video.with_name(out_video.stem + "_latentsync_raw" + out_video.suffix)
+
     inner = f'''
 set -euo pipefail
 source {conda_sh}
@@ -322,12 +388,97 @@ python -m scripts.inference \
   --enable_deepcache \
   --video_path "{video}" \
   --audio_path "{audio}" \
-  --video_out_path "{out_video}"
+  --video_out_path "{latentsync_temp}"
 '''
     run_cmd(["bash", "-lc", inner], log=log)
 
+    # Remux with the intended driving audio to ensure clean audio track
+    log("Remuxing LatentSync output with intended driving audio...")
+    remux_video_with_audio(latentsync_temp, audio, out_video, log=log)
 
-def run_pipeline(video_path: str, target_language: str, source_language: str = "Auto", progress_log: Callable[[str], None] = print) -> dict:
+    # Clean up temporary file
+    if latentsync_temp.exists():
+        latentsync_temp.unlink()
+        log(f"Cleaned up temporary file: {latentsync_temp}")
+
+
+def verify_asr_language(audio: Path, expected_language: str, cfg: PipelineConfig, log=print) -> dict:
+    """Verify the dubbed audio language via ASR transcription.
+
+    Returns dict with:
+        - transcript: str, ASR output
+        - detected_language: str, detected language
+        - expected_language: str, what we expected
+        - match: bool, whether detected matches expected
+        - chinese_chars: int, count of Chinese characters
+        - english_words: int, count of English words
+        - language_purity: float, ratio of expected language content (0-1)
+        - warning: Optional[str], warning message if unexpected content detected
+    """
+    import re
+
+    log(f"ASR verification: checking audio language matches expected '{expected_language}'...")
+    detected, transcript = transcribe_qwen(audio, None, cfg, log=log)
+
+    # Count Chinese characters (CJK Unified Ideographs range)
+    chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', transcript))
+
+    # Count English words (sequences of ASCII letters)
+    english_words = len(re.findall(r'[a-zA-Z]+', transcript))
+
+    # Calculate language purity
+    total_content = chinese_chars + english_words
+    if total_content == 0:
+        language_purity = 0.0
+    elif expected_language == "Chinese":
+        language_purity = chinese_chars / total_content if total_content > 0 else 0.0
+    elif expected_language == "English":
+        language_purity = english_words / total_content if total_content > 0 else 0.0
+    else:
+        # For other languages, trust the detected language
+        language_purity = 1.0 if detected == expected_language else 0.0
+
+    result = {
+        "transcript": transcript,
+        "detected_language": detected,
+        "expected_language": expected_language,
+        "match": detected == expected_language,
+        "chinese_chars": chinese_chars,
+        "english_words": english_words,
+        "language_purity": language_purity,
+        "warning": None,
+    }
+
+    # Generate warnings
+    if expected_language == "Chinese" and english_words > 10:
+        ratio = english_words / (chinese_chars + 1)
+        if ratio > 0.3:
+            result["warning"] = f"WARNING: Unexpected English content ratio - Chinese:{chinese_chars}, English:{english_words} (ratio={ratio:.2f})"
+            log(result["warning"])
+    elif expected_language == "English" and chinese_chars > 10:
+        ratio = chinese_chars / (english_words + 1)
+        if ratio > 0.3:
+            result["warning"] = f"WARNING: Unexpected Chinese content ratio - English:{english_words}, Chinese:{chinese_chars} (ratio={ratio:.2f})"
+            log(result["warning"])
+
+    log(f"ASR verification complete: detected={detected}, purity={language_purity:.2%}, chinese={chinese_chars}, english={english_words}")
+    return result
+
+
+def run_pipeline(video_path: str, target_language: str, source_language: str = "Auto",
+                  progress_log: Callable[[str], None] = print, verify_output: bool = False) -> dict:
+    """Run the full dubbing pipeline.
+
+    Args:
+        video_path: Path to input video
+        target_language: Target language for dubbing
+        source_language: Source language ("Auto" for auto-detect)
+        progress_log: Callback for progress logging
+        verify_output: If True, run ASR verification on final output
+
+    Returns:
+        dict with job metadata including status, paths, and optional verification results
+    """
     cfg = PipelineConfig()
     cfg.workdir.mkdir(parents=True, exist_ok=True)
     job = cfg.workdir / time.strftime("%Y%m%d-%H%M%S")
@@ -346,20 +497,44 @@ def run_pipeline(video_path: str, target_language: str, source_language: str = "
     raw_tts = job / "translated_raw.wav"
     fit_tts = job / "translated_fit.wav"
     out_video = job / "dubbed_video.mp4"
+    out_audio = job / "output_16k.wav"
     meta_path = job / "metadata.json"
 
     started = time.perf_counter()
+    timing = {}
     try:
         log(f"Job dir: {job}")
+        t0 = time.perf_counter()
         src_dur = extract_audio(src_video, source_wav, log=log)
+        timing["audio_extraction_s"] = time.perf_counter() - t0
+
         trim_reference_audio(source_wav, ref_wav, log=log)
+
+        t0 = time.perf_counter()
         detected, transcript = transcribe_qwen(source_wav, source_language, cfg, log=log)
-        translated = translate_deepseek(transcript, target_language, cfg, detected, log=log)
+        timing["asr_s"] = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        # Pass source duration hint for concise translation
+        translated = translate_deepseek(transcript, target_language, cfg, detected, log=log, source_duration_hint=src_dur)
+        timing["translation_s"] = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
         synthesize_qwen_clone(translated, target_language, ref_wav, transcript, raw_tts, cfg, log=log, target_duration=src_dur)
-        timefit_audio(raw_tts, src_dur, fit_tts, log=log)
+        timing["tts_s"] = time.perf_counter() - t0
+
+        # Capture timefit metrics for metadata
+        timefit_metrics = timefit_audio(raw_tts, src_dur, fit_tts, log=log)
+
         cleanup_cuda(log=log)
+
+        t0 = time.perf_counter()
         run_latentsync(src_video, fit_tts, out_video, cfg, log=log)
+        timing["latentsync_s"] = time.perf_counter() - t0
+
         elapsed = time.perf_counter() - started
+        timing["total_s"] = elapsed
+
         meta = {
             "status": "ok",
             "job_dir": str(job),
@@ -370,7 +545,23 @@ def run_pipeline(video_path: str, target_language: str, source_language: str = "
             "translated_text": translated,
             "output_video": str(out_video),
             "elapsed_s": elapsed,
+            "timing": timing,
+            "tts_raw_duration_s": timefit_metrics.get("raw_duration"),
+            "tts_fit_ratio": timefit_metrics.get("ratio"),
+            "tts_warning": timefit_metrics.get("warning"),
         }
+
+        # Optional ASR verification
+        if verify_output:
+            log("Running ASR verification on output...")
+            # Extract audio from output video for verification
+            extract_audio(out_video, out_audio, log=log)
+            cleanup_cuda(log=log)  # Clear before loading ASR again
+            asr_result = verify_asr_language(out_audio, target_language, cfg, log=log)
+            meta["asr_verification"] = asr_result
+            if asr_result.get("warning"):
+                meta["asr_verification_warning"] = asr_result["warning"]
+
         meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2))
         (job / "run.log").write_text("\n".join(log_lines))
         return meta

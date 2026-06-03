@@ -29,6 +29,7 @@ ENV/
 # Runs and outputs
 runs/
 *.mp4
+!docs/demo/*.mp4
 *.wav
 *.mp3
 

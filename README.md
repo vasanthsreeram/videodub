@@ -45,6 +45,8 @@ Single-container GPU-powered video dubbing with voice cloning and lip sync.
 | `LATENTSYNC_GUIDANCE` | `1.5` | LatentSync guidance scale |
 | `QWEN_TTS_MAX_NEW_TOKENS` | `2048` | Max tokens for TTS generation |
 | `QWEN_TTS_X_VECTOR_ONLY` | `1` | Use x-vector-only voice cloning (prevents reference text leakage) |
+| `ATEMPO_WARN_THRESHOLD` | `1.20` | Log warning if TTS duration exceeds this ratio of source duration |
+| `ATEMPO_MAX_THRESHOLD` | `1.50` | Log critical warning if TTS duration exceeds this ratio |
 
 ## Supported Languages
 
@@ -138,6 +140,50 @@ The TTS will fail loudly at startup if CUDA is not available, unless `ALLOW_CPU_
 **Translation fails**: Check `DEEPSEEK_API_KEY` is set correctly.
 
 **Face not detected**: LatentSync requires clear face visibility. Use videos with consistent face shots.
+
+## Demo / Benchmark Outputs
+
+See [docs/demo/README.md](docs/demo/README.md) for demo videos and benchmark results.
+
+### Quick Benchmark Summary (RTX A6000)
+
+| Metric | Value |
+|--------|-------|
+| Input | 44s English video (1440x2560) |
+| Output | 44s Chinese dubbed video |
+| Total E2E time | ~15 minutes |
+| TTS generation | ~4 minutes |
+| LatentSync inference | ~9 minutes |
+| Realtime factor | ~20x (15 min for 44s video) |
+
+### Comparison with Other Pipelines
+
+See [docs/benchmark-existing-pipelines.md](docs/benchmark-existing-pipelines.md) for detailed comparison against:
+- **pyvideotrans** - Subtitle-level TTS, most mature community project
+- **video-dubbing-translator** - Sentence-level TTS with XTTS voice cloning
+- **KrillinAI**, **SoniTranslate**, **Linly-Dubbing** - Other notable alternatives
+
+Key differentiators of this pipeline:
+- Single Docker container with all dependencies
+- Qwen3-TTS (2025) for state-of-art Chinese/multilingual voice cloning
+- LatentSync for lip-sync without separate face detection
+- x-vector-only mode prevents source language leakage
+
+## Running Benchmarks
+
+```bash
+# Inside Docker container
+docker exec -it videodub bash
+source /opt/conda/etc/profile.d/conda.sh
+conda activate qwen-dub
+
+# Run benchmark with ASR verification
+python /app/videodub/scripts/run_benchmark.py \
+  --input /path/to/video.mp4 \
+  --target Chinese \
+  --verify \
+  --output-json benchmark.json
+```
 
 ## License
 
