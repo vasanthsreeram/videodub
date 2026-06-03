@@ -16,6 +16,7 @@ services:
       - LATENTSYNC_STEPS=${LATENTSYNC_STEPS:-20}
       - LATENTSYNC_GUIDANCE=${LATENTSYNC_GUIDANCE:-1.5}
       - QWEN_TTS_MAX_NEW_TOKENS=${QWEN_TTS_MAX_NEW_TOKENS:-2048}
+      - QWEN_TTS_X_VECTOR_ONLY=${QWEN_TTS_X_VECTOR_ONLY:-1}
       - NVIDIA_VISIBLE_DEVICES=all
     volumes:
       # Persistent model cache (avoid re-downloading)

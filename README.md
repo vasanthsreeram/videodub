@@ -44,6 +44,7 @@ Single-container GPU-powered video dubbing with voice cloning and lip sync.
 | `LATENTSYNC_STEPS` | `20` | LatentSync inference steps (lower = faster) |
 | `LATENTSYNC_GUIDANCE` | `1.5` | LatentSync guidance scale |
 | `QWEN_TTS_MAX_NEW_TOKENS` | `2048` | Max tokens for TTS generation |
+| `QWEN_TTS_X_VECTOR_ONLY` | `1` | Use x-vector-only voice cloning (prevents reference text leakage) |
 
 ## Supported Languages
 
@@ -108,15 +109,17 @@ docker run --gpus all -p 7860:7860 \
 The pipeline requires NVIDIA GPU with CUDA. To verify GPU is correctly configured:
 
 ```bash
-# Quick CUDA check (no model download)
-docker exec videodub python /app/videodub/scripts/check_tts_gpu.py
-
-# Full model load test (downloads model if needed)
-docker exec videodub python /app/videodub/scripts/check_tts_gpu.py --load-model
-
-# Check nvidia-smi
+# Check nvidia-smi inside container
 docker exec videodub nvidia-smi
+
+# Quick CUDA check via qwen-dub env (no model download)
+docker exec videodub /app/videodub/scripts/check_gpu.sh
+
+# Full model load test (downloads model if needed, ~10GB first time)
+docker exec videodub /app/videodub/scripts/check_gpu.sh --load-model
 ```
+
+**Note**: GPU checks must run inside the `qwen-dub` conda environment where PyTorch is installed. The `check_gpu.sh` wrapper handles this automatically. Do not use `docker exec videodub python ...` directly as base Python does not have torch.
 
 **Important Docker flags:**
 - Must use `--gpus all` or NVIDIA runtime
